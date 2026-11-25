@@ -85,6 +85,7 @@ struct Tenant {
     int parent;
     i64 quota, used = 0;
     i64 settled = 0, rate = 0, intercept = 0;
+    i64 completedEst = 0, completedActual = 0;
 };
 struct Job {
     int id, wf, cpu, mem, est, img, inputRack;
@@ -94,10 +95,12 @@ struct Job {
     int state = 0; // 0 pending, 1 running, 2 done
     int machine = -1, machinePos = -1, start = -1, outputRack = -1;
     int tail = 0;
+    i64 setup = 0;
+    i64 floorCost = 0, floorCompute = 0;
 };
 struct Workflow {
     int id, tenant, arrival, deadline, done = 0;
-    i64 value, remainingWork = 0;
+    i64 value, remainingWork = 0, remainingFloor = 0, remainingCompute = 0;
     bool dropped = false, completed = false;
     vector<int> jobs;
     int slackVersion = -1;
@@ -292,10 +295,16 @@ struct Scheduler {
     }
     void done(int j) {
         Job& job = jobs[j];
+        Tenant& tenant = tenants[workflows[job.wf].tenant];
+        tenant.completedEst += job.est;
+        tenant.completedActual += max<i64>(1, (i64)tick - job.start - job.setup);
         job.outputRack = machines[job.machine].rack;
         release(j); job.state = 2;
         Workflow& wf = workflows[job.wf];
-        ++wf.done; wf.remainingWork -= (i64)job.cpu * job.est;
+        ++wf.done;
+        wf.remainingWork -= (i64)job.cpu * job.est;
+        wf.remainingFloor -= job.floorCost;
+        wf.remainingCompute -= job.floorCompute;
         if (wf.done == (int)wf.jobs.size()) wf.completed = true;
         for (int v : job.succ) --jobs[v].remainingPred;
     }
@@ -352,9 +361,32 @@ struct Scheduler {
                 job.pred.push_back(jobById.at(id));
             }
             int index = (int)jobs.size();
+            i64 best = INF, bestCompute = INF, chosenCompute = 0;
+            for (int x = 0; x < M; ++x) {
+                const Machine& m = machines[x];
+                if (m.cpu < job.cpu || m.mem < job.mem) continue;
+                i64 compute = (i64)job.cpu * job.est * price[racks[m.rack].dc];
+                bestCompute = min(bestCompute, compute);
+                i64 transfer = 0;
+                if (job.inputRack != -1 && job.inputRack != m.rack) {
+                    i64 d = distance(m.rack, job.inputRack);
+                    if (d == INF) continue;
+                    transfer = job.inputSize * d * Unet;
+                }
+                if (compute + transfer < best) {
+                    best = compute + transfer;
+                    chosenCompute = compute;
+                }
+            }
+            job.floorCost = best != INF ? best :
+                            (bestCompute != INF ? bestCompute : INF / 100000);
+            job.floorCompute = best != INF ? chosenCompute :
+                               (bestCompute != INF ? bestCompute : 0);
             jobById[job.id] = index;
             jobs.push_back(move(job)); stored.jobs.push_back(index);
             stored.remainingWork += (i64)jobs[index].cpu * jobs[index].est;
+            stored.remainingFloor += jobs[index].floorCost;
+            stored.remainingCompute += jobs[index].floorCompute;
             for (int p : jobs[index].pred) jobs[p].succ.push_back(index);
         }
         for (int i = count - 1; i >= 0; --i) {
@@ -419,17 +451,28 @@ struct Scheduler {
         }
         return {reg, rack};
     }
-    i64 predictedRevenue(const Workflow& wf, int finish) const {
+    i64 predictedRevenue(const Workflow& wf, i64 finish) const {
         int grace = max(5, (wf.deadline - wf.arrival) / 3);
         if (finish <= wf.deadline) return wf.value;
         if (finish >= wf.deadline + grace) return 0;
         return wf.value * (wf.deadline + grace - finish) / grace;
     }
+    double durationBias(int tenant) const {
+        const Tenant& t = tenants[tenant];
+        double b = (double)(t.completedActual + 30) / (t.completedEst + 30);
+        return max(0.6, min(2.5, b));
+    }
 
-    struct Choice { int machine = -1; i64 transferFee = 0; double score = 1e100; };
+    struct Choice {
+        int machine = -1;
+        i64 transferFee = 0;
+        double score = 1e100, estimatedCost = 0;
+        i64 revenue = 0;
+    };
     Choice chooseMachine(int j) {
         const Job& job = jobs[j];
         const Workflow& wf = workflows[job.wf];
+        double bias = durationBias(wf.tenant);
         Choice best;
         if (!quotaFits(wf.tenant, job.cpu)) return best;
         for (int x = 0; x < M; ++x) {
@@ -445,19 +488,23 @@ struct Scheduler {
             }
             i64 pullTime = ceildiv(reg, Breg) + ceildiv(rack, Brack);
             i64 setup = max(transferTime, pullTime);
-            i64 finish = tick + setup + job.tail;
-            i64 revenue = predictedRevenue(wf, (int)finish);
+            i64 finish = tick + setup + (i64)ceil(job.tail * 1.2 * bias);
+            i64 revenue = predictedRevenue(wf, finish);
             if (!revenue || finish > T) continue;
             double delayPenalty = (double)wf.value / max(5, wf.deadline - wf.arrival) * setup;
-            double cost = (double)job.cpu * price[racks[m.rack].dc] * (job.est + setup)
-                        + transferFee + reg * Ureg + delayPenalty;
-            if (cost < best.score) { best = {x, transferFee, cost}; }
+            double cost = (double)job.cpu * price[racks[m.rack].dc] * (job.est * bias + setup)
+                        + transferFee + reg * Ureg;
+            double score = cost + delayPenalty;
+            if (score < best.score) best = {x, transferFee, score, cost, revenue};
         }
         return best;
     }
     void run(int j, int x, i64 transferFee) {
         Job& job = jobs[j]; Machine& m = machines[x];
+        i64 transferTime = 0, checkedFee = 0;
+        inputTransfer(j, m.rack, transferTime, checkedFee);
         auto [reg, rack] = pull(j, x);
+        job.setup = max(transferTime, ceildiv(reg, Breg) + ceildiv(rack, Brack));
         int tenant = workflows[job.wf].tenant;
         settle(tenant, transferFee + reg * Ureg);
         startAccounting(tenant, job.cpu, (i64)job.cpu * price[racks[m.rack].dc], tick);
@@ -510,11 +557,14 @@ struct Scheduler {
             if (job.state != 0 || job.remainingPred != 0) continue;
             const Workflow& wf = workflows[job.wf];
             if (wf.dropped || wf.completed) continue;
-            i64 revenue = predictedRevenue(wf, tick + job.tail);
-            if (tick + job.tail > T || revenue <= 0 ||
-                revenue * 5 < wf.remainingWork * minPrice * 4) continue;
+            double bias = durationBias(wf.tenant);
+            i64 expectedFinish = tick + (i64)ceil(job.tail * 1.2 * bias);
+            i64 revenue = predictedRevenue(wf, expectedFinish);
+            double floor = wf.remainingFloor + (bias - 1.0) * wf.remainingCompute;
+            if (expectedFinish > T || revenue <= 0 ||
+                revenue < floor * 1.25) continue;
             double urgency = 1.0 + 0.25 * max(0, 12 - (wf.deadline - tick - job.tail));
-            double key = urgency * (double)revenue / max<i64>(1, wf.remainingWork * minPrice);
+            double key = urgency * (double)revenue / max(1.0, floor);
             ready.push_back({j, key});
         }
         size_t cap = min<size_t>(128, ready.size());
@@ -527,6 +577,12 @@ struct Scheduler {
             int j = ready[i].j;
             Choice choice = chooseMachine(j);
             if (choice.machine == -1) continue;
+            const Job& job = jobs[j];
+            const Workflow& wf = workflows[job.wf];
+            double bias = durationBias(wf.tenant);
+            double futureFloor = wf.remainingFloor - job.floorCost +
+                                 (bias - 1.0) * (wf.remainingCompute - job.floorCompute);
+            if (choice.revenue < 3.2 * (choice.estimatedCost + max(0.0, futureFloor))) continue;
             out += "RUN " + to_string(jobs[j].id) + " " + to_string(choice.machine) + "\n";
             run(j, choice.machine, choice.transferFee);
         }
