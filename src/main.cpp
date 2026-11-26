@@ -563,11 +563,10 @@ struct Scheduler {
             double floor = wf.remainingFloor + (bias - 1.0) * wf.remainingCompute;
             if (expectedFinish > T || revenue <= 0 ||
                 revenue < floor * 1.25) continue;
-            double urgency = 1.0 + 0.25 * max(0, 12 - (wf.deadline - tick - job.tail));
-            double key = urgency * (double)revenue / max(1.0, floor);
+            double key = (double)revenue / max(1.0, floor);
             ready.push_back({j, key});
         }
-        size_t cap = min<size_t>(128, ready.size());
+        size_t cap = min<size_t>(96, ready.size());
         partial_sort(ready.begin(), ready.begin() + cap, ready.end(),
                      [](const Candidate& a, const Candidate& b) {
                          if (a.score != b.score) return a.score > b.score;
@@ -582,7 +581,8 @@ struct Scheduler {
             double bias = durationBias(wf.tenant);
             double futureFloor = wf.remainingFloor - job.floorCost +
                                  (bias - 1.0) * (wf.remainingCompute - job.floorCompute);
-            if (choice.revenue < 3.2 * (choice.estimatedCost + max(0.0, futureFloor))) continue;
+            if (choice.revenue < 5.0 *
+                                     (choice.estimatedCost + max(0.0, futureFloor))) continue;
             out += "RUN " + to_string(jobs[j].id) + " " + to_string(choice.machine) + "\n";
             run(j, choice.machine, choice.transferFee);
         }
